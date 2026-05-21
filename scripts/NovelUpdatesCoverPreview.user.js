@@ -1,7 +1,8 @@
 // ==UserScript==
+/* jshint esversion: 11 */
 // @name        Novel Updates Cover Preview
 // @namespace   Nazgand.NovelUpdates
-// @version     3
+// @version     4
 // @description Previews cover image when hovering over hyperlinks that lead to Novel Updates series pages & some other pages. Forked from [The Original Version Made By SZ] (https://greasyfork.org/en/scripts/26439-novelupdates-cover-preview).
 // @author      Nazgand
 // @supportURL  Https://GitHub.Com/Nazgand/UserScripts/discussions
@@ -37,10 +38,10 @@
 (function () {
 	"use strict";
 	// User Settings
-	const UpdateAtCacheAge = 39 ** 6; // Minimum Age of Cached data in milliseconds required to send an HTTP request to check whether the cache should be updated. Ignored if the cached data is missing or corrupt.
-	let EnablePreloader = true;
+	const UpdateAtCacheAge = 15 ** 9; // Minimum Age of Cached data in milliseconds required to send an HTTP request to check whether the cache should be updated. Ignored if the cached data is missing or corrupt.
+	let EnablePreloader = false;
 	const MaximumTotalPreloads = 15;
-	const MaximumSitePreloads = 5;
+	const MaximumSitePreloads = 3;
 	const PreloadDelayMs = 398;
 	const color = {
 		'Background': '#303e59',
@@ -53,8 +54,7 @@
 	let useReadingListIconAndTitle = true;
 	// END User Settings
 
-	const eventListenerStyle = 0; //undefined/0 forEach seriesLink addeventlistener(mouseenter/mouseleave) / 1 window addeventlistener(mousemove)
-	const version = "3";
+	const version = "4";
 	const forceUpdate = false;
 	const PREDEFINED_NATIVE_TITLE = "Recommended by";
 	const targetContainerIDArrayToObserve = [
@@ -62,6 +62,199 @@
 		"messageList",
 		"myTable",
 	];
+
+	// Rate limiting and backoff configuration
+	const REQUEST_JITTER_MS = 100; // Random jitter to add to delays
+	const MAX_BACKOFF_ATTEMPTS = 5; // Maximum exponential backoff attempts
+	const BACKOFF_BASE_MS = 1000; // Base backoff time (1 second)
+
+	// Per-domain request queues for rate limiting
+	const requestQueues = {};
+	const activeRequests = {};
+
+	// Add random jitter to delay to make timing less predictable
+	function addJitter(delayMs) {
+		return delayMs + Math.random() * REQUEST_JITTER_MS;
+	}
+
+	// Extract domain from URL for queuing
+	function extractDomain(url) {
+		try {
+			const urlObj = new URL(url);
+			return urlObj.hostname;
+		} catch (e) {
+			return "unknown";
+		}
+	}
+
+	// Get or create request queue for a domain
+	function getRequestQueue(domain) {
+		if (!requestQueues[domain]) {
+			requestQueues[domain] = [];
+			activeRequests[domain] = false;
+		}
+		return requestQueues[domain];
+	}
+
+	// Process queued requests for a domain (uses stack/LIFO for most recent first)
+	function processRequestQueue(domain) {
+		if (activeRequests[domain] || requestQueues[domain].length === 0) {
+			return;
+		}
+
+		activeRequests[domain] = true;
+		const { resolve, reject, apiPoint, options, hoveredLink } = requestQueues[domain].pop();
+
+		// Make the actual request
+		makeRequest(apiPoint, options, hoveredLink)
+			.then(resolve)
+			.catch(reject)
+			.finally(() => {
+				activeRequests[domain] = false;
+				// Add delay before processing next request for this domain
+				setTimeout(() => processRequestQueue(domain), addJitter(PreloadDelayMs));
+			});
+	}
+
+	// Make the actual HTTP request (internal function)
+	function makeRequest(apiPoint, options, hoveredLink = undefined) {
+		return new Promise((resolve, reject) => {
+			const { hasDataContainer, responsetype, useDocumentFallback, retryCount = 0 } = options;
+
+			function onLoad(xhr) {
+				switch (true) {
+					case xhr.status == 304:
+					case xhr.status >= 200 && xhr.status < 399: {
+						let apiData;
+						switch (responsetype) {
+							case "json":
+								try {
+									let tempJSON = JSON.parse(xhr.responseText);
+									if (hasDataContainer) apiData = tempJSON[hasDataContainer];
+									else apiData = tempJSON;
+								} catch (e) { }
+								break;
+							case "Document":
+								{
+									const domDocument = xhr.response;
+									apiData = domDocument;
+								}
+								break;
+							case "text":
+								{
+									const domText = xhr.responseText;
+									// Validate response is not empty
+									if (!domText || domText.length === 0) {
+										return reject("Empty response received");
+									}
+									// Check Content-Length if available to verify complete download
+									try {
+										if (xhr.getResponseHeader && typeof xhr.getResponseHeader === 'function') {
+											const contentLength = xhr.getResponseHeader("Content-Length");
+											if (contentLength && domText.length < parseInt(contentLength)) {
+												return reject(`Incomplete response: expected ${contentLength} bytes, received ${domText.length} bytes`);
+											}
+										}
+									} catch (headerError) {
+										// Ignore header errors, continue with validation
+									}
+									// Validate response length is reasonable (not truncated)
+									if (domText.length < 100) {
+										return reject("Suspiciously short response (possibly truncated)");
+									}
+									let parser = new DOMParser();
+									let domDocument;
+									try {
+										domDocument = parser.parseFromString(
+											domText,
+											"text/html",
+										);
+										// Validate DOMParser succeeded
+										if (!domDocument) {
+											return reject("DOMParser returned null");
+										}
+										// Validate document structure
+										if (!domDocument.documentElement) {
+											return reject("Parsed document has no documentElement");
+										}
+										// Check for parser errors (DOMParser creates <parsererror> element on failure)
+										const parserError = domDocument.querySelector("parsererror");
+										if (parserError) {
+											return reject("DOMParser error: " + parserError.textContent);
+										}
+										// Validate document has body
+										if (!domDocument.body) {
+											return reject("Parsed document has no body element");
+										}
+									} catch (parseError) {
+										// If fallback is enabled and parsing failed, try responseType: "document"
+										if (useDocumentFallback) {
+											makeRequest(apiPoint, { hasDataContainer, responsetype: "Document", useDocumentFallback, retryCount }, hoveredLink)
+												.then(resolve)
+												.catch(reject);
+											return;
+										}
+										return reject("DOM parsing exception: " + parseError.message);
+									}
+									apiData = domDocument;
+								}
+								break;
+							default:
+								const domDocument = xhr.responseText;
+								apiData = domDocument;
+								break;
+						}
+						if (apiData !== undefined) return resolve(apiData);
+						else
+							return reject(
+								"no apiData error for responsetype: " + responsetype,
+							);
+					}
+					case xhr.status == 403:
+						// Implement exponential backoff on 403 errors, but only if link is still being hovered
+						if (retryCount < MAX_BACKOFF_ATTEMPTS) {
+							// Check if the link is still being hovered (if hoveredLink was provided)
+							if (hoveredLink !== undefined) {
+								// If currentTitleHover is set and doesn't match hoveredLink, don't retry
+								if (currentTitleHover !== undefined && currentTitleHover !== hoveredLink) {
+									return reject(rejectErrorStatusMessage(xhr));
+								}
+							}
+							const backoffDelay = BACKOFF_BASE_MS * Math.pow(2, retryCount) + Math.random() * REQUEST_JITTER_MS;
+							console.warn(`getDataFromAPI: 403 error for ${apiPoint}, retrying in ${backoffDelay}ms (attempt ${retryCount + 1}/${MAX_BACKOFF_ATTEMPTS})`);
+							setTimeout(() => {
+								makeRequest(apiPoint, { hasDataContainer, responsetype, useDocumentFallback, retryCount: retryCount + 1 }, hoveredLink)
+									.then(resolve)
+									.catch(reject);
+							}, backoffDelay);
+							return;
+						}
+						console.error(`getDataFromAPI: Max retry attempts (${MAX_BACKOFF_ATTEMPTS}) reached for 403 error on ${apiPoint}`);
+						return reject(rejectErrorStatusMessage(xhr));
+					default:
+						return reject(rejectErrorStatusMessage(xhr));
+				}
+			}
+
+			function onError(_) {
+				return reject(false);
+			}
+
+			GM.xmlHttpRequest({
+				method: "GET",
+				responseType: responsetype,
+				url: apiPoint,
+				headers: {
+					"User-Agent": navigator.userAgent,
+					"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+					"Accept-Language": navigator.language,
+					"Referer": window.location.href,
+				},
+				onload: onLoad,
+				onerror: onError,
+			});
+		});
+	}
 	const NU_REGEX = "^https?://(?:www\\.)?novelupdates\\.com/series/([\\w-]+)";
 	const MD_REGEX = "^https?://(?:www\\.)?mangadex\\.org/(?:title|manga)/([^/\\s]+)";
 	const TV_REGEX = "^https?://(?:www\\.)?tvmaze\\.com/shows/(\\d+)";
@@ -367,7 +560,6 @@
 	};
 	const mutationObserver = new MutationObserver(callbackMutationObserver);
 	const debouncedPreloadCoverData = debounce(preloadCoverData, 100);
-	const throttledGetHoveredItem = throttle(getHoveredItem, 50);
 	async function checkDataVersion() {
 		const dataVersion = await GM.getValue("version", null);
 		if (
@@ -643,6 +835,7 @@
 				elementUrl,
 				targetPage,
 				targetDomain,
+				currentTitleHover,
 			);
 		}
 		let imageLink;
@@ -814,9 +1007,6 @@
 	}
 	function syncLinksByCacheKey(cacheKey, state) {
 		if (!cacheKey) return;
-		if (state === linkIconEnum.error && cacheKey === activeHoverCacheKey) {
-			hidePopUp();
-		}
 		for (let i = 0; i < AllSeriesNodes.length; i++) {
 			const el = AllSeriesNodes[i];
 			if (el.getAttribute("data-cache-key") === cacheKey) {
@@ -894,7 +1084,7 @@
 							Object.assign(coverData, newCoverData);
 						}
 					} catch (err) {
-						console.error("Background update failed", err);
+						// Background update failed silently
 					} finally {
 						if (coverData.updateStatus !== "done") {
 							coverData.updateStatus = "done";
@@ -906,22 +1096,65 @@
 				})();
 			}
 		} else {
-			showPopupLoading(hoveredTitle, hoveredTitle, event);
-			PromiseResult = getCoverDataFromUrl(rawNetworkUrl, targetPage).then(async (cData) => {
-				if (cData && cData.readyPromise) {
-					await cData.readyPromise;
-				}
-				if (cData && cData.title) {
-					cData.updateStatus = "done";
-					await GM_setCachedValue(cacheKey, cData);
-				}
-				return cData;
-			});
+			// Check if cover data has been loaded in the meantime before showing loading
+			const cachedData = await GM_getCachedValue(cacheKey);
+			if (cachedData && cachedData.url && cachedData.title) {
+				PromiseResult = cachedData;
+			} else {
+				showPopupLoading(hoveredTitle, hoveredTitle, event);
+				PromiseResult = getCoverDataFromUrl(rawNetworkUrl, targetPage).then(async (cData) => {
+					if (cData && cData.readyPromise) {
+						await cData.readyPromise;
+					}
+					if (cData && cData.title) {
+						cData.updateStatus = "done";
+						await GM_setCachedValue(cacheKey, cData);
+					}
+					return cData;
+				});
+			}
 		}
 		PromiseResult = await PromiseResult;
 		if (!PromiseResult || !PromiseResult.title) {
 			syncLinksByCacheKey(cacheKey, linkIconEnum.error);
-			throw new Error("No valid data found for " + cacheKey);
+			const error = new Error("No valid data found for " + cacheKey);
+			error.url = rawNetworkUrl;
+			error.cacheKey = cacheKey;
+			error.targetPage = targetPage;
+			error.context = "parseSeriesPage: getCoverDataFromUrl returned invalid or missing data";
+			throw error;
+		}
+		// Retry if image URL is missing but we have other data
+		if (!PromiseResult.url && PromiseResult.title && !forceReload) {
+			const retryInterval = 333; // milliseconds
+			const maxRetryTime = 9993;
+			const startTime = Date.now();
+			let retryCount = 0;
+
+			while (!PromiseResult.url && (Date.now() - startTime) < maxRetryTime) {
+				// Check if cover data has been loaded in the meantime (e.g., by another request)
+				const cachedData = await GM_getCachedValue(cacheKey);
+				if (cachedData && cachedData.url && cachedData.title) {
+					return cachedData;
+				}
+
+				retryCount++;
+				// Update loading message with retry count
+				if (currentTitleHover === hoveredTitle) {
+					showPopupLoading(hoveredTitle, hoveredTitle, event, `Retry ${retryCount}`);
+				}
+
+				await new Promise(resolve => setTimeout(resolve, retryInterval));
+				try {
+					const retryData = await parseSeriesPage(element, true, hoveredTitle, event, targetPage);
+					if (retryData && retryData.url) {
+						return retryData;
+					}
+					PromiseResult = retryData;
+				} catch (retryError) {
+					// Retry failed, continue
+				}
+			}
 		}
 		syncLinksByCacheKey(cacheKey, linkIconEnum.popupHasCoverData);
 		return PromiseResult;
@@ -929,14 +1162,8 @@
 	function removeEventListenerFromNodes(arrayTargetNode) {
 		if (arrayTargetNode && arrayTargetNode.length > 0) {
 			arrayTargetNode.map(function (el) {
-				if (
-					eventListenerStyle === undefined ||
-					eventListenerStyle === null ||
-					eventListenerStyle == 0
-				) {
-					el.removeEventListener("mouseenter", mouseEnterPopup);
-					el.removeEventListener("mouseleave", hideOnMouseLeave);
-				}
+				el.removeEventListener("mouseenter", mouseEnterPopup);
+				el.removeEventListener("mouseleave", hideOnMouseLeave);
 			});
 		}
 	}
@@ -960,7 +1187,7 @@
 					Preloads["AllSites"].Completed >= MaximumTotalPreloads)) ||
 			siteState.PendingNodes.length === 0
 		) {
-			siteState.Timeout = null;
+			siteState.Timeout = setTimeout(preloaderLoop, addJitter(PreloadDelayMs), siteKey);
 			return;
 		}
 		if (
@@ -969,7 +1196,7 @@
 				Preloads["AllSites"].Completed + Preloads["AllSites"].InProgress >=
 				MaximumTotalPreloads)
 		) {
-			siteState.Timeout = setTimeout(preloaderLoop, PreloadDelayMs, siteKey);
+			siteState.Timeout = setTimeout(preloaderLoop, addJitter(PreloadDelayMs), siteKey);
 			return;
 		}
 		const visibleIndex = siteState.PendingNodes.findIndex(node =>
@@ -982,7 +1209,7 @@
 			Preloads["AllSites"].InProgress++;
 			preloadForIndividualPage(node, targetPage, false, siteKey);
 		}
-		siteState.Timeout = setTimeout(preloaderLoop, PreloadDelayMs, siteKey);
+		siteState.Timeout = setTimeout(preloaderLoop, addJitter(PreloadDelayMs), siteKey);
 	}
 	async function preloadForIndividualPage(
 		element,
@@ -990,7 +1217,9 @@
 		forceReload = false,
 		siteKey = undefined,
 	) {
-		if (!EnablePreloader && !showIconNextToLink && !forceReload) {
+		// Only return early if this is a preloader request (siteKey is defined) and preloader is disabled
+		// If forceReload is true, this is a user-initiated hover request, not preloading
+		if (siteKey !== undefined && !EnablePreloader && !showIconNextToLink && !forceReload) {
 			return;
 		}
 		const elementUrl = element.href;
@@ -1029,7 +1258,7 @@
 			});
 	}
 	async function preloadCoverData(forceReload = false) {
-		if (!EnablePreloader && !showIconNextToLink && !forceReload) { return; }
+		// Always populate AllSeriesNodes and add event listeners, even if preloading is disabled
 		AllSeriesNodes = [];
 		for (let i = 0; i < linkConfigKeys.length; i++) {
 			const siteKey = linkConfigKeys[i];
@@ -1052,18 +1281,14 @@
 		removeEventListenerFromNodes(AllSeriesNodes);
 		if (AllSeriesNodes.length > 0) {
 			AllSeriesNodes.forEach(node => {
-				if (eventListenerStyle == 0) {
-					node.addEventListener("mouseenter", mouseEnterPopup);
-					node.addEventListener("mouseleave", hideOnMouseLeave);
-				}
+				node.addEventListener("mouseenter", mouseEnterPopup);
+				node.addEventListener("mouseleave", hideOnMouseLeave);
 			});
-			for (let i = 0; i < linkConfigKeys.length; i++) {
-				const siteKey = linkConfigKeys[i];
-				if (
-					Preloads[siteKey] &&
-					Preloads[siteKey].PendingNodes.length > 0 &&
-					!Preloads[siteKey].Timeout
-				) {
+			// Only start preloader loops if preloading is enabled
+			if (EnablePreloader) {
+				preloaderLoop("AllSites");
+				for (let i = 0; i < linkConfigKeys.length; i++) {
+					const siteKey = linkConfigKeys[i];
 					preloaderLoop(siteKey);
 				}
 			}
@@ -1362,7 +1587,12 @@
 			dummyCoverData.votes = "⏳ Loading rating…";
 			dummyCoverData.status = "⏳ Loading status…";
 			dummyCoverData.alternativeNames = "⏳ Loading alternative names…";
-			dummyCoverData.description = notification || "⏳ Loading description…";
+			// Include retry count in description if notification contains retry info
+			if (notification && notification.includes("Retry")) {
+				dummyCoverData.description = "⏳ Loading cover image… " + notification;
+			} else {
+				dummyCoverData.description = notification || "⏳ Loading description…";
+			}
 			dummyCoverData.genre = "⏳ Loading tags…";
 			dummyCoverData.Tags = "⏳ Loading tags…";
 			dummyCoverData.readingListTitle = "⏳ Loading reading list…";
@@ -1470,19 +1700,33 @@
 	function refreshPopUp(coverData, e = undefined) {
 		if (coverData && coverData !== undefined) {
 			const link = coverData.url;
+			// Delete LoadingErrors when loading completes (URL is present)
+			if (link && link !== "undefined" && coverData.LoadingErrors) {
+				delete coverData.LoadingErrors;
+			}
 			if (
 				link === undefined ||
 				link === null ||
 				link == "" ||
 				link == "undefined"
 			) {
-				if (coverData.isLoading) {
-					popupContent.innerHTML =
-						'<div class="containerPadding">⏳ Loading cover image…</div>';
+				// Show description if it contains retry information, otherwise show loading message
+				let contentHtml = '<div class="containerPadding">';
+				if (coverData.description && coverData.description.includes("Retry")) {
+					contentHtml += coverData.description;
 				} else {
-					popupContent.innerHTML =
-						'<div class="containerPadding">No Cover Image found</div>';
+					contentHtml += '⏳ Loading cover image…';
 				}
+				// Display errors from LoadingErrors field if present
+				if (coverData.LoadingErrors && coverData.LoadingErrors.length > 0) {
+					const errorDetails = coverData.LoadingErrors.map((err, idx) => {
+						const errMsg = err.message || String(err);
+						return `Attempt ${idx + 1}: ${errMsg}`;
+					}).join('<br/>');
+					contentHtml += '<br/><br/><div style="margin-top: 8px; font-size: 0.85em; color: #ff6b6b;"><strong>Previous errors:</strong><br/>' + errorDetails + '</div>';
+				}
+				contentHtml += '</div>';
+				popupContent.innerHTML = contentHtml;
 			} else {
 				popupContent.innerHTML =
 					'<img src="' + link + '" class="ImgFitDefault" ></img>';
@@ -1789,13 +2033,8 @@
 				);
 			}
 		} catch (Error) {
-			syncLinksByCacheKey(getLinkToSeriesPage(element.href, targetPage), linkIconEnum.error);
-			showPopupLoading(
-				hoveredTitle,
-				hoveredTitle,
-				currentEvent,
-				Error.message || Error.statusText || Error,
-			);
+			const cacheKey = getLinkToSeriesPage(element.href, targetPage);
+			syncLinksByCacheKey(cacheKey, linkIconEnum.error);
 		}
 	}
 	function imageLoaded(
@@ -1804,6 +2043,10 @@
 		seriesTitle = undefined,
 		e = undefined,
 	) {
+		// Delete LoadingErrors when loading completes
+		if (coverData && coverData.LoadingErrors) {
+			delete coverData.LoadingErrors;
+		}
 		const hasMouseEnterEvent = seriesTitle && e !== undefined;
 		const isActivePopup =
 			currentTitleHover !== undefined &&
@@ -1827,25 +2070,27 @@
 		} else {
 			filename = "";
 		}
-		let additionalText = "";
-		if (errorText) additionalText = errorText;
-		let errorMessage =
-			'<div class="containerPadding">browser blocked/has error loading the cover: <br />' +
-			filename +
-			"<br />" +
-			additionalText +
-			"</div>";
+		// If URL is missing, this is a parsing error, not a browser loading error
+		// Don't call showPopupError as it creates a dummy coverData that overwrites real data
 		if (filename == "") {
-			errorMessage =
-				'<div class="containerPadding">target site has no coverImage<br />[no image tag found]<br /></div>';
+			// Let the normal error handling in refreshPopUp handle this
+			// Don't create a dummy coverData that overwrites the actual parsed data
+			return;
 		}
-		showPopupLoading(
-			hoveredTitleLink,
-			seriesTitle,
-			e,
-			errorMessage,
-			coverData,
-		);
+		// If we have valid metadata (title, description, etc.), don't overwrite it with error popup
+		// Instead, just clear the URL and let refreshPopUp show the metadata without the image
+		if (coverData.title || coverData.description) {
+			coverData.url = undefined;
+			// Refresh popup to show metadata without image
+			const isActivePopup =
+				currentTitleHover !== undefined &&
+				hoveredTitleLink !== undefined &&
+				currentTitleHover == hoveredTitleLink;
+			if (isActivePopup) {
+				refreshPopUp(coverData, e);
+			}
+			return;
+		}
 	}
 	/**
 	 * Fills popupContent with text metadata (description, genre, tags, etc.) while
@@ -1871,9 +2116,9 @@
 	}
 	async function loadImageFromBrowser({
 		coverData,
-		e = undefined,
-		seriesTitle = undefined,
-		hoveredTitleLink = undefined,
+		e,
+		seriesTitle,
+		hoveredTitleLink,
 	}) {
 		let img = document.createElement("img"); //put img into dom. Let the image preload in background
 		img.onload = () => {
@@ -1952,13 +2197,7 @@
 		if (!config) return [];
 		if (arrayTargetNode && arrayTargetNode.length > 0) {
 			arrayTargetNode.forEach(function (selector) {
-				if (
-					eventListenerStyle === undefined ||
-					eventListenerStyle === null ||
-					eventListenerStyle == 0
-				) {
-					selector.removeEventListener("mouseleave", hideOnMouseLeave);
-				}
+				selector.removeEventListener("mouseleave", hideOnMouseLeave);
 			});
 		}
 		const keywords = config.selectorKeywords || [config.searchString];
@@ -2012,7 +2251,6 @@
 	async function switchDetailsAndUpdatePopup() {
 		await changeToNewDetailStyle();
 		updateCurrentPopupContent();
-		console.groupEnd("switchDetails");
 	}
 	async function switchTagsDescriptionAndUpdatePopup() {
 		if (showDetails) {
@@ -2342,31 +2580,6 @@
 			}
 			mutationObserver.disconnect();
 		});
-		if (eventListenerStyle == 1) {
-			window.addEventListener("mousemove", throttledGetHoveredItem);
-		}
-	}
-	function getHoveredItem(e) {
-		if (eventListenerStyle == 1) {
-			let isManagedLink = false;
-			if (e.target && e.target.nodeName == "A" && e.target.href) {
-				isManagedLink = linkConfigKeys.some((key) => (new RegExp(key, "i")).test(e.target.href));
-			}
-			if (
-				e.target &&
-				e.target != lastTarget &&
-				e.target.nodeName == "A" &&
-				isManagedLink
-			) {
-				lastTarget = e.target;
-				mouseEnterPopup(e);
-			} else {
-				if (e.target.nodeName != "A") {
-					lastTarget = undefined;
-					hideOnMouseLeave();
-				}
-			}
-		}
 	}
 	main();
 	async function checkImageServerState(url) {
@@ -2377,15 +2590,21 @@
 						return resolve(true);
 					}
 					default:
-						return reject(false);
+						return resolve(false);
 				}
 			}
 			function onError(_) {
-				return reject(false);
+				return resolve(false);
 			}
 			GM.xmlHttpRequest({
 				method: "HEAD",
 				url: url,
+				headers: {
+					"User-Agent": navigator.userAgent,
+					"Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+					"Accept-Language": navigator.language,
+					"Referer": window.location.href,
+				},
 				onload: onLoad,
 				onerror: onError,
 			});
@@ -2396,82 +2615,44 @@
 	}
 	async function getDataFromAPI(
 		apiPoint,
-		{ hasDataContainer = undefined, responsetype = "json" } = {},
+		{ hasDataContainer, responsetype = "json", useDocumentFallback = false, retryCount = 0, hoveredLink } = {},
 	) {
-		let PromiseResult = new Promise(async function (resolve, reject) {
-			function onLoad(xhr) {
-				switch (true) {
-					case xhr.status == 304:
-					case xhr.status >= 200 && xhr.status < 399: {
-						let apiData;
-						switch (responsetype) {
-							case "json":
-								try {
-									let tempJSON = JSON.parse(xhr.responseText);
-									if (hasDataContainer) apiData = tempJSON[hasDataContainer];
-									else apiData = tempJSON;
-								} catch (e) { }
-								break;
-							case "Document":
-								{
-									const domDocument = xhr.response;
-									apiData = domDocument;
-								}
-								break;
-							case "text":
-								{
-									const domText = xhr.responseText;
-									let parser = new DOMParser();
-									const domDocument = parser.parseFromString(
-										domText,
-										"text/html",
-									);
-									apiData = domDocument;
-								}
-								break;
-							default:
-								const domDocument = xhr.responseText;
-								apiData = domDocument;
-								break;
-						}
-						if (apiData !== undefined) return resolve(apiData);
-						else
-							return reject(
-								"no apiData error for responsetype: " + responsetype,
-							);
-					}
-					default:
-						return reject(rejectErrorStatusMessage(xhr));
-				}
-			}
-			function onError(_) {
-				return reject(false);
-			}
-			GM.xmlHttpRequest({
-				method: "GET",
-				responseType: responsetype,
-				url: apiPoint,
-				onload: onLoad,
-				onerror: onError,
-			});
-			return undefined; //reject("status error")
+		// Skip queuing for API endpoints (mangadex, tvmaze) - only queue HTML parsing requests
+		if (responsetype === "json" || responsetype === "Document") {
+			return makeRequest(apiPoint, { hasDataContainer, responsetype, useDocumentFallback, retryCount }, hoveredLink);
+		}
+
+		const domain = extractDomain(apiPoint);
+		const queue = getRequestQueue(domain);
+		const options = { hasDataContainer, responsetype, useDocumentFallback, retryCount };
+
+		// Return a promise that will be resolved when the request is processed
+		return new Promise((resolve, reject) => {
+			queue.push({ resolve, reject, apiPoint, options, hoveredLink });
+			processRequestQueue(domain);
 		});
-		PromiseResult = await PromiseResult;
-		return PromiseResult;
 	}
 	async function getCoverDataFromMangaDex(id) {
 		if (id) {
-			let mangaDexData = getDataFromAPI(
-				"https://api.mangadex.org/manga/" + id + "?includes[]=cover_art&includes[]=author",
-				{ hasDataContainer: "data" },
-			);
-			let seriesChapters = getDataFromAPI(
-				"https://api.mangadex.org/manga/" + id + "/aggregate"
-			);
-			let seriesStats = getDataFromAPI(
-				"https://api.mangadex.org/statistics/manga/" + id
-			);
-			mangaDexData = await mangaDexData;
+			let mangaDexData, seriesChapters, seriesStats;
+			try {
+				mangaDexData = getDataFromAPI(
+					"https://api.mangadex.org/manga/" + id + "?includes[]=cover_art&includes[]=author",
+					{ hasDataContainer: "data" },
+				);
+				seriesChapters = getDataFromAPI(
+					"https://api.mangadex.org/manga/" + id + "/aggregate"
+				);
+				seriesStats = getDataFromAPI(
+					"https://api.mangadex.org/statistics/manga/" + id
+				);
+				mangaDexData = await mangaDexData;
+			} catch (error) {
+				let cData = Object.assign({}, emptyCoverData);
+				cData.url = undefined;
+				cData.title = "Error loading from MangaDex";
+				return cData;
+			}
 			let seriesGenre = [];
 			let seriesTags = [];
 			if (mangaDexData && mangaDexData.attributes && mangaDexData.attributes.tags) {
@@ -2542,14 +2723,22 @@
 	};
 	async function getCoverDataFromTVmaze(id) {
 		if (id) {
-			let apiData = getDataFromAPI("https://api.tvmaze.com/shows/" + id);
-			let seriesAlternativeNames = getDataFromAPI(
-				"https://api.tvmaze.com/shows/" + id + "/akas",
-			);
-			let episodes = getDataFromAPI(
-				"https://api.tvmaze.com/shows/" + id + "/episodes",
-			);
-			apiData = await apiData;
+			let apiData, seriesAlternativeNames, episodes;
+			try {
+				apiData = getDataFromAPI("https://api.tvmaze.com/shows/" + id);
+				seriesAlternativeNames = getDataFromAPI(
+					"https://api.tvmaze.com/shows/" + id + "/akas",
+				);
+				episodes = getDataFromAPI(
+					"https://api.tvmaze.com/shows/" + id + "/episodes",
+				);
+				apiData = await apiData;
+			} catch (error) {
+				let cData = Object.assign({}, emptyCoverData);
+				cData.url = undefined;
+				cData.title = "Error loading from TVmaze";
+				return cData;
+			}
 			let targetImageUrl;
 			if (apiData.image) {
 				targetImageUrl = apiData.image.medium || apiData.image.original;
@@ -2613,9 +2802,6 @@
 		let seriesDescription;
 		let seriesReadingListIcon, seriesReadingListTitle;
 		temp = domDocument.querySelectorAll(targetPage.seriesImage);
-		if (targetPage.CONTAINER_NUMBER) {
-			containerNumber = targetPage.CONTAINER_NUMBER;
-		}
 		imageLink = temp[containerNumber];
 		seriesTitle = domDocument.querySelector(targetPage.seriesPageTitle);
 		seriesAlternativeNames = domDocument.querySelector(
@@ -2637,8 +2823,40 @@
 		);
 		let cData = Object.assign({}, emptyCoverData);
 		if (imageLink) {
-			cData.url = imageLink.getAttribute("data-src") || imageLink.getAttribute("src") || imageLink.getAttribute("href") || undefined;
+			// Try multiple attributes to find the image URL
+			cData.url = imageLink.getAttribute("data-src") ||
+				imageLink.getAttribute("src") ||
+				imageLink.getAttribute("href") ||
+				imageLink.getAttribute("data-original") ||
+				imageLink.getAttribute("data-lazy-src") ||
+				undefined;
+			// Handle srcset: parse to extract URL without resolution descriptors
+			if (!cData.url) {
+				const srcset = imageLink.getAttribute("srcset");
+				if (srcset) {
+					// srcset format: "url1 1x, url2 2x, url3 3x" or "url1 450w, url2 900w"
+					// Extract the first URL before any space or comma
+					const srcsetMatch = srcset.match(/^\s*(\S+)/);
+					if (srcsetMatch) {
+						cData.url = srcsetMatch[1];
+					} else {
+						// Fallback to split method if regex fails
+						cData.url = srcset.split(',')[0]?.trim()?.split(/\s+/)[0];
+					}
+				}
+			}
 			if (!cData.url) cData.url = imageLink.src || imageLink.href;
+			// If still no URL, check if it's a background image
+			if (!cData.url) {
+				const bgImage = window.getComputedStyle ? window.getComputedStyle(imageLink).backgroundImage : imageLink.style.backgroundImage;
+				if (bgImage && bgImage !== 'none') {
+					const urlMatch = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+					if (urlMatch) cData.url = urlMatch[1];
+				}
+			}
+			if (!cData.url) {
+				cData.url = undefined;
+			}
 		} else {
 			cData.url = undefined;
 		}
@@ -2675,15 +2893,41 @@
 		elementUrl,
 		targetPage,
 		targetDomain = undefined,
+		hoveredLink = undefined,
 	) {
 		if (targetPage) {
 			elementUrl = elementUrl.replace(/^https?:\/\/(m|www)\.webnovel\.com/, "https://webnovel.com");
 			elementUrl = elementUrl.replace(/^https?:\/\/(www\.)?royalroadl?\.com/, "https://royalroad.com");
-			let domDocument = await getDataFromAPI(elementUrl, {
-				responsetype: "text",
-			});
+			let domDocument;
+			try {
+				domDocument = await getDataFromAPI(elementUrl, {
+					responsetype: "text",
+					useDocumentFallback: true,
+					hoveredLink: hoveredLink,
+				});
+			} catch (error) {
+				let cData = Object.assign({}, emptyCoverData);
+				cData.url = undefined;
+				cData.title = "Error loading page";
+				return cData;
+			}
+			// Validate domDocument before extraction
+			if (!domDocument) {
+				let cData = Object.assign({}, emptyCoverData);
+				cData.url = undefined;
+				cData.title = "Error loading page";
+				return cData;
+			}
+			if (!domDocument.documentElement) {
+				let cData = Object.assign({}, emptyCoverData);
+				cData.url = undefined;
+				cData.title = "Error loading page";
+				return cData;
+			}
 			const cData = extractCoverDataFromDocument(domDocument, targetPage, targetDomain);
-			if (!isCoverDataValid(cData)) return undefined;
+			if (!isCoverDataValid(cData)) {
+				return undefined;
+			}
 			return cData;
 		}
 		return undefined;
@@ -2738,4 +2982,5 @@
 		prepareEventListener();
 		await cacheCurrentPage();
 	}
+	main();
 })();

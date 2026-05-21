@@ -37,7 +37,7 @@ The `NovelUpdatesCoverPreview.user.js` is a TamperMonkey script that previews co
 
 The following settings can be configured at the top of the script (before `// END User Settings`):
 
-- **UpdateAtCacheAge**: Minimum age of cached data (in milliseconds) before the script attempts a background update (~40.7 days by default).
+- **UpdateAtCacheAge**: Minimum age of cached data (in milliseconds) before the script attempts a background update (~445 days by default).
 - **EnablePreloader**: Enables or disables the autonomous background prefetching engine.
 - **MaximumTotalPreloads**: Global limit for the number of background preloads allowed in a single session.
 - **MaximumSitePreloads**: Per-site limit for background preloads to prevent hammering a single domain.
@@ -48,6 +48,17 @@ The following settings can be configured at the top of the script (before `// EN
 
 - - -
 ## Development Notes
+
+### CHANGES 3 ➡ 4:
+
+- **403 Error Retry**: Retries with exponential backoff when encountering 403 errors.
+- **Enhanced Image URL Extraction**: Added support for multiple image attributes (`data-original`, `data-lazy-src`), `srcset` parsing, and background image extraction via `getComputedStyle`.
+- **Removed Dead Code**: Eliminated unused `eventListenerStyle` constant and all associated dead code paths (window mousemove event listener, conditional checks, and `getHoveredItem` function).
+- **Removed Dead Code**: Eliminated `CONTAINER_NUMBER` check in `extractCoverDataFromDocument` (property never defined in any linkConfigs).
+- **Request Context**: Added `hoveredLink` parameter to `getCoverDataFromParsingTargetUrl` for better retry logic context.
+- **Document Fallback**: Added `useDocumentFallback` parameter to `getDataFromAPI` calls for improved HTML parsing reliability.
+- **DOM Validation**: Added comprehensive validation in `getCoverDataFromParsingTargetUrl` to check for null/undefined domDocument and missing documentElement before extraction.
+- **Error Handling**: Added try-catch blocks and error handling in `getCoverDataFromParsingTargetUrl` to gracefully handle network failures.
 
 ### CHANGES 2.6.0 ➡ 3:
 
@@ -195,7 +206,7 @@ Deterministic geometric constraints ensure zero-overlap and constant visibility.
 ## 5\. Data Extraction & Maintenance
 
 - **Recursive Extraction**: `tryToGetTextContent` recursively extracts text and links while preserving UPIB styling and converting `br` tags.
-- **Cache Lifecycle**: Silent refresh triggered after `39 ** 6 ms` (~40.7 days).
+- **Cache Lifecycle**: Silent refresh triggered after `15 ** 9 ms` (~445 days).
   Background `updateStatus` validation runs transparently to re-verify expired
   cache objects.
   - **Diagnostics**: `drawLinkToPopupLine()` bridge verifies coordinate
